@@ -34,6 +34,11 @@ import unicodedata
 import string
 import re
 import random
+import time
+import math
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -61,6 +66,8 @@ use_cuda = torch.cuda.is_available()
 
 SOS_token = 0
 EOS_token = 1
+MAX_LENGTH = 10
+teacher_forcing_ratio = 0.5
 
 
 class Lang:
@@ -124,13 +131,13 @@ def readLangs(lang1, lang2, reverse=False):
     # 翻转对,Lang实例化
     if reverse:
         pairs = [list(reversed(p)) for p in pairs]
-        input_lang = Lang(lang2)
-        output_lang = Lang(lang1)
+        input_lang = Lang(lang2)   # fra
+        output_lang = Lang(lang1)  # eng
     else:
         input_lang = Lang(lang1)
         output_lang = Lang(lang2)
 
-    return input_lang, output_lang, pairs
+    return input_lang, output_lang, pairs    # pairs: [['va !', 'go .'], []]
 
 
 ######################################################################
@@ -138,7 +145,6 @@ def readLangs(lang1, lang2, reverse=False):
 # 这里的单词的最大长度是10词(包括结束标点符号),我们正在过滤到翻译
 # 成"I am"或"He is"等形式的句子.(考虑到先前替换了撇号).
 
-MAX_LENGTH = 10
 
 eng_prefixes = (
     "i am ", "i m ",
@@ -181,10 +187,6 @@ def prepareData(lang1, lang2, reverse=False):
     print(input_lang.name, input_lang.n_words)
     print(output_lang.name, output_lang.n_words)
     return input_lang, output_lang, pairs
-
-
-input_lang, output_lang, pairs = prepareData('eng', 'fra', True)
-print(random.choice(pairs))
 
 
 ######################################################################
@@ -241,6 +243,7 @@ Examples::
                  [ 0.9124, -2.3616,  1.1151]]])
 """
 
+
 class EncoderRNN(nn.Module):
     def __init__(self, input_size, hidden_size):
         """
@@ -250,14 +253,22 @@ class EncoderRNN(nn.Module):
         super(EncoderRNN, self).__init__()
         self.hidden_size = hidden_size
 
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.embedding = nn.Embedding(num_embeddings=input_size, embedding_dim=hidden_size)
+
+        # 输入: input: (seq_len, batch, input_size), h_0: (num_layers * num_directions, batch, hidden_size)
+        # 输出: output: (seq_len, batch, num_directions * hidden_size), h_n: same as h_0
+        self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
 
     def forward(self, input, hidden):
-        embedded = self.embedding(input).view(1, 1, -1)
+        # embedded = self.embedding(input).view(1, 1, -1)
+
+
+        embedded = self.embedding(input)     # input: size([1]), embedded: [1, 256]
+        embedded = embedded.view(1, 1, -1)   # [1, 1, 256]
+
         output = embedded
         output, hidden = self.gru(output, hidden)
-        return output, hidden
+        return output, hidden    # output: [1, 1, 256], hidden: [1, 1, 256]
 
     def initHidden(self):
         result = Variable(torch.zeros(1, 1, self.hidden_size))
@@ -288,7 +299,7 @@ class EncoderRNN(nn.Module):
 # .. figure:: /_static/img/seq-seq-images/decoder-network.png
 #    :alt:
 #
-#
+
 
 class DecoderRNN(nn.Module):
     def __init__(self, hidden_size, output_size):
@@ -316,7 +327,6 @@ class DecoderRNN(nn.Module):
 
 ######################################################################
 #我们鼓励你训练和观察这个模型的结果,但为了节省空间,我们将直接进正题引入注意力机制.
-#
 
 
 ######################################################################
@@ -329,43 +339,44 @@ class DecoderRNN(nn.Module):
 # 首先我们计算一组注意力权重. 这些将被乘以编码器输出矢量获得加权的组合. 
 # 结果(在代码中为``attn_applied``) 应该包含关于输入序列的特定部分的信息,
 # 从而帮助解码器选择正确的输出单词.
-#
-# .. figure:: https://i.imgur.com/1152PYf.png
-#    :alt:
-#
+
+
 # 使用解码器的输入和隐藏状态作为输入,利用另一个前馈层 ``attn``计算注意力权重, 
 # 由于训练数据中有各种大小的句子,为了实际创建和训练此层,
 # 我们必须选择最大长度的句子(输入长度,用于编码器输出),以适用于此层.
 # 最大长度的句子将使用所有注意力权重,而较短的句子只使用前几个.
-#
-# .. figure:: /_static/img/seq-seq-images/attention-decoder-network.png
-#    :alt:
-#
-#
+
 
 class AttnDecoderRNN(nn.Module):
     def __init__(self, hidden_size, output_size, dropout_p=0.1, max_length=MAX_LENGTH):
+        """
+        :param hidden_size:  256
+        :param output_size: size of output language vocabulary 2925
+        :param dropout_p:
+        :param max_length:
+        """
         super(AttnDecoderRNN, self).__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.dropout_p = dropout_p
         self.max_length = max_length
 
-        self.embedding = nn.Embedding(self.output_size, self.hidden_size)
+        self.embedding = nn.Embedding(num_embeddings=self.output_size, embedding_dim=self.hidden_size)
         self.attn = nn.Linear(self.hidden_size * 2, self.max_length)
         self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
         self.dropout = nn.Dropout(self.dropout_p)
-        self.gru = nn.GRU(self.hidden_size, self.hidden_size)
+        self.gru = nn.GRU(input_size=self.hidden_size, hidden_size=self.hidden_size)
         self.out = nn.Linear(self.hidden_size, self.output_size)
 
     def forward(self, input, hidden, encoder_outputs):
         embedded = self.embedding(input).view(1, 1, -1)
         embedded = self.dropout(embedded)
 
-        attn_weights = F.softmax(
-            self.attn(torch.cat((embedded[0], hidden[0]), 1)), dim=1)
-        attn_applied = torch.bmm(attn_weights.unsqueeze(0),
-                                 encoder_outputs.unsqueeze(0))
+        attn_weights = F.softmax(self.attn(torch.cat((embedded[0], hidden[0]), 1)), dim=1)
+
+        # Performs a batch matrix-matrix product of matrices stored in :attr:`batch1` and :attr:`batch2`
+        # batch1` is a `b x n x m` Tensor, batch2` is a `b x m x p` Tensor, out` will be a `b x n x p` Tensor.
+        attn_applied = torch.bmm(attn_weights.unsqueeze(0), encoder_outputs.unsqueeze(0))
 
         output = torch.cat((embedded[0], attn_applied[0]), 1)
         output = self.attn_combine(output).unsqueeze(0)
@@ -395,16 +406,16 @@ class AttnDecoderRNN(nn.Module):
 # -----------------------
 #为了训练,对于每一对我们将需要输入的张量(输入句子中的词的索引)和
 # 目标张量(目标语句中的词的索引). 在创建这些向量时,我们会将EOS标记添加到两个序列中.
-#
+
 
 def indexesFromSentence(lang, sentence):
     return [lang.word2index[word] for word in sentence.split(' ')]
 
 
 def variableFromSentence(lang, sentence):
-    indexes = indexesFromSentence(lang, sentence)
+    indexes = indexesFromSentence(lang, sentence)    # 标点符号也算进词库里面了
     indexes.append(EOS_token)
-    result = Variable(torch.LongTensor(indexes).view(-1, 1))
+    result = Variable(torch.LongTensor(indexes).view(-1, 1))   # shape: [length_of_sentence, 1]
     if use_cuda:
         return result.cuda()
     else:
@@ -412,8 +423,8 @@ def variableFromSentence(lang, sentence):
 
 
 def variablesFromPair(pair):
-    input_variable = variableFromSentence(input_lang, pair[0])
-    target_variable = variableFromSentence(output_lang, pair[1])
+    input_variable = variableFromSentence(input_lang, pair[0])     # shape: [length_of_sentence, 1]
+    target_variable = variableFromSentence(output_lang, pair[1])   # shape: [length_of_sentence, 1]
     return (input_variable, target_variable)
 
 
@@ -437,8 +448,6 @@ def variablesFromPair(pair):
 # 打开``teacher_forcing_ratio``更多的使用它.
 #
 
-teacher_forcing_ratio = 0.5
-
 
 def train(input_variable, target_variable, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, max_length=MAX_LENGTH):
     encoder_hidden = encoder.initHidden()
@@ -446,18 +455,18 @@ def train(input_variable, target_variable, encoder, decoder, encoder_optimizer, 
     encoder_optimizer.zero_grad()
     decoder_optimizer.zero_grad()
 
-    input_length = input_variable.size()[0]
+    input_length = input_variable.size()[0]    # input_variable, shape: [length_of_sentence, 1]
     target_length = target_variable.size()[0]
 
-    encoder_outputs = Variable(torch.zeros(max_length, encoder.hidden_size))
+    encoder_outputs = Variable(torch.zeros(max_length, encoder.hidden_size))   # 输入语言对应的一句话经过encoder后的输出
     encoder_outputs = encoder_outputs.cuda() if use_cuda else encoder_outputs
 
     loss = 0
-
+    # 对于每一个输入的句子,每个时刻输入一个单词进行编码.编码器的初始隐藏层状态为全0状态,上一个隐层状态输出作为下一时刻的输入
     for ei in range(input_length):
         encoder_output, encoder_hidden = encoder(
             input_variable[ei], encoder_hidden)
-        encoder_outputs[ei] = encoder_output[0][0]
+        encoder_outputs[ei] = encoder_output[0][0]   # 注: variable 和 Tensor 一样, 也能进行切片
 
     decoder_input = Variable(torch.LongTensor([[SOS_token]]))
     decoder_input = decoder_input.cuda() if use_cuda else decoder_input
@@ -499,10 +508,6 @@ def train(input_variable, target_variable, encoder, decoder, encoder_optimizer, 
 
 ######################################################################
 # 根据当前时间和进度百分比,这是一个帮助功能,用于打印经过的时间和估计的剩余时间.
-#
-
-import time
-import math
 
 
 def asMinutes(s):
@@ -528,7 +533,7 @@ def timeSince(since, percent):
 # -  为绘图建空损失数组
 #
 # 然后我们多次调用``train``,偶尔打印进度(样本的百分比,到目前为止的时间,估计的时间)和平均损失. 
-#
+
 
 def trainIters(encoder, decoder, n_iters, print_every=1000, plot_every=100, learning_rate=0.01):
     start = time.time()
@@ -573,9 +578,7 @@ def trainIters(encoder, decoder, n_iters, print_every=1000, plot_every=100, lear
 # 使用matplotlib完成绘图, 使用训练时保存的损失值``plot_losses``数组.
 #
 
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-import numpy as np
+
 
 
 def showPlot(points):
@@ -665,38 +668,6 @@ def evaluateRandomly(encoder, decoder, n=10):
 #    注释编码器和解码器初始化的行并再次运行 ``trainIters`` .
 #
 
-hidden_size = 256
-encoder1 = EncoderRNN(input_lang.n_words, hidden_size)
-attn_decoder1 = AttnDecoderRNN(hidden_size, output_lang.n_words, dropout_p=0.1)
-
-
-if use_cuda:
-    encoder1 = encoder1.cuda()
-    attn_decoder1 = attn_decoder1.cuda()
-
-trainIters(encoder1, attn_decoder1, 75000, print_every=5000)
-
-######################################################################
-#
-
-evaluateRandomly(encoder1, attn_decoder1)
-
-
-######################################################################
-# 可视化注意力
-# ---------------------
-#
-# 注意力机制的一个有用特性是其高度可解释的输出. 
-# 由于它用于对输入序列的特定编码器输出进行加权,因此我们可以想象在每个时间步骤中查看网络最关注的位置.
-#
-# 您可以简单地运行 ``plt.matshow(attentions)``,将注意力输出显示为矩阵,
-# 其中列是输入步骤,行是输出步骤.
-#
-
-output_words, attentions = evaluate(
-    encoder1, attn_decoder1, "je suis trop froid .")
-plt.matshow(attentions.numpy())
-
 
 ######################################################################
 # 为了获得更好的观看体验,我们将额外添加轴和标签:
@@ -729,6 +700,41 @@ def evaluateAndShowAttention(input_sentence):
     showAttention(input_sentence, output_words, attentions)
 
 
+#####################################
+# 主程序
+input_lang, output_lang, pairs = prepareData('eng', 'fra', True)
+print(random.choice(pairs))
+
+hidden_size = 256
+encoder1 = EncoderRNN(input_lang.n_words, hidden_size)
+attn_decoder1 = AttnDecoderRNN(hidden_size, output_lang.n_words, dropout_p=0.1)
+
+
+if use_cuda:
+    encoder1 = encoder1.cuda()
+    attn_decoder1 = attn_decoder1.cuda()
+
+trainIters(encoder1, attn_decoder1, 75000, print_every=5000)
+
+evaluateRandomly(encoder1, attn_decoder1)
+
+
+######################################################################
+# 可视化注意力
+# ---------------------
+#
+# 注意力机制的一个有用特性是其高度可解释的输出.
+# 由于它用于对输入序列的特定编码器输出进行加权,因此我们可以想象在每个时间步骤中查看网络最关注的位置.
+#
+# 您可以简单地运行 ``plt.matshow(attentions)``,将注意力输出显示为矩阵,
+# 其中列是输入步骤,行是输出步骤.
+
+
+output_words, attentions = evaluate(
+    encoder1, attn_decoder1, "je suis trop froid .")
+plt.matshow(attentions.numpy())
+
+
 evaluateAndShowAttention("elle a cinq ans de moins que moi .")
 
 evaluateAndShowAttention("elle est trop petit .")
@@ -756,4 +762,4 @@ evaluateAndShowAttention("c est un jeune directeur plein de talent .")
 #    -  训练自编码器
 #    -  只保存编码器网络
 #    -  从那里训练一个新的解码器进行翻译
-#
+

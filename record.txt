@@ -1,0 +1,1 @@
+criterion = nn.NLLLoss() 这个loss学习一下
